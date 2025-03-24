@@ -299,122 +299,288 @@ class TiktokApiClient extends VideoApiClient {
   @override
   Future<app_models.VideoModel> getVideoInfo(String url) async {
     try {
-      // Trích xuất ID video từ URL
+      // Xác định video ID từ URL
       final videoId = AppConstants.getTiktokVideoId(url);
       if (videoId == null) {
         throw VideoApiException(
-          message: 'URL TikTok không hợp lệ',
+          message: 'Không thể xác định ID video từ URL TikTok',
         );
       }
 
-      // Gọi API không watermark để lấy thông tin video
-      final response = await dio.get(
-        'https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/feed/?aweme_id=$videoId',
-        options: Options(
-          headers: {
-            'User-Agent':
-                'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet'
-          },
-        ),
-      );
-
-      if (response.statusCode != 200) {
-        throw VideoApiException(
-          message: 'Lỗi API TikTok: ${response.statusCode}',
-          statusCode: response.statusCode,
-        );
-      }
-
-      final data = response.data;
-      if (data == null ||
-          data['aweme_list'] == null ||
-          data['aweme_list'].isEmpty) {
-        throw VideoApiException(
-          message: 'Không tìm thấy thông tin video TikTok',
-        );
-      }
-
-      final videoData = data['aweme_list'][0];
-      final authorData = videoData['author'] ?? {};
-      final videoUrlData = videoData['video'] ?? {};
-
-      // URL không watermark
-      String downloadUrl = '';
-      if (videoUrlData['play_addr'] != null &&
-          videoUrlData['play_addr']['url_list'] != null &&
-          videoUrlData['play_addr']['url_list'].isNotEmpty) {
-        downloadUrl = videoUrlData['play_addr']['url_list'][0];
-      }
-
-      // URL có watermark
-      String downloadUrlWithWatermark = '';
-      if (videoUrlData['download_addr'] != null &&
-          videoUrlData['download_addr']['url_list'] != null &&
-          videoUrlData['download_addr']['url_list'].isNotEmpty) {
-        downloadUrlWithWatermark = videoUrlData['download_addr']['url_list'][0];
-      }
-
-      // Nếu không có URL không watermark, sử dụng URL có watermark
-      if (downloadUrl.isEmpty) {
-        downloadUrl = downloadUrlWithWatermark;
-      }
-
-      if (downloadUrl.isEmpty) {
-        throw VideoApiException(
-          message: 'Không tìm thấy URL tải xuống cho video TikTok',
-        );
-      }
-
-      final qualities = [
-        app_models.VideoQuality(
-          label: 'Không watermark',
-          url: downloadUrl,
-          fileSize: 0,
-        ),
+      // Thử lần lượt từng phương pháp
+      List<Future<app_models.VideoModel> Function()> methods = [
+        () => getAwemeApiNoWatermark(
+            url, videoId), // Phương pháp 1: API chính thức
+        () => getTikwmApiNoWatermark(url, videoId), // Phương pháp 2: TikWM API
+        () => getSsstikNoWatermark(url, videoId), // Phương pháp 3: SsstikIO
       ];
 
-      // Thêm phiên bản có watermark nếu khác với URL không watermark
-      if (downloadUrlWithWatermark.isNotEmpty &&
-          downloadUrlWithWatermark != downloadUrl) {
-        qualities.add(
-          app_models.VideoQuality(
-            label: 'Có watermark',
-            url: downloadUrlWithWatermark,
-            fileSize: 0,
-          ),
-        );
+      for (var method in methods) {
+        try {
+          return await method();
+        } catch (e) {
+          // Ghi log lỗi nhưng tiếp tục với phương pháp tiếp theo
+          debugPrint(
+              'Phương pháp tải video không watermark thất bại: ${e.toString()}');
+          continue;
+        }
       }
 
-      // Trích xuất thông tin thêm
-      final title = videoData['desc'] ?? 'TikTok Video #$videoId';
-      final author = authorData['nickname'] ?? 'TikTok Creator';
-      final authorAvatar = authorData['avatar_larger']?['url_list']?[0] ?? '';
-      final cover = videoData['cover']?['url_list']?[0] ??
-          videoData['origin_cover']?['url_list']?[0] ??
-          '';
-
-      // Tính thời lượng từ số khung hình và tốc độ khung hình
-      final duration = videoUrlData['duration'] != null
-          ? Duration(milliseconds: videoUrlData['duration'])
-          : const Duration(seconds: 15); // Mặc định 15s cho TikTok
-
-      return app_models.VideoModel(
-        id: videoId,
-        title: title,
-        author: author,
-        authorAvatarUrl: authorAvatar,
-        thumbnailUrl: cover,
-        originalUrl: url,
-        source: app_models.VideoSource.tiktok,
-        duration: duration,
-        publishedAt: DateTime.now(),
-        availableQualities: qualities,
+      // Nếu tất cả phương pháp đều thất bại
+      throw VideoApiException(
+        message:
+            'Không thể tải xuống video TikTok không có watermark. TikTok có thể đã thay đổi API của họ. Vui lòng thử lại sau.',
       );
     } catch (e) {
       if (e is VideoApiException) rethrow;
       throw VideoApiException(
         message: 'Lỗi lấy thông tin video TikTok: ${e.toString()}',
       );
+    }
+  }
+
+  /// Phương pháp 1: Sử dụng Aweme API (API TikTok chính thức)
+  Future<app_models.VideoModel> getAwemeApiNoWatermark(
+      String url, String videoId) async {
+    final String apiUrl =
+        'https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/feed/?aweme_id=$videoId';
+    final response = await dio.get(
+      apiUrl,
+      options: Options(
+        headers: {
+          'User-Agent':
+              'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet'
+        },
+      ),
+    );
+
+    if (response.statusCode != 200) {
+      throw VideoApiException(
+        message: 'Lỗi API TikTok: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
+    }
+
+    final data = response.data;
+    if (data == null ||
+        data['aweme_list'] == null ||
+        data['aweme_list'].isEmpty) {
+      throw VideoApiException(
+        message: 'Không tìm thấy thông tin video TikTok',
+      );
+    }
+
+    final videoData = data['aweme_list'][0];
+    final authorData = videoData['author'] ?? {};
+    final videoUrlData = videoData['video'] ?? {};
+
+    // URL không watermark
+    String downloadUrl = '';
+    if (videoUrlData['play_addr'] != null &&
+        videoUrlData['play_addr']['url_list'] != null &&
+        videoUrlData['play_addr']['url_list'].isNotEmpty) {
+      downloadUrl = videoUrlData['play_addr']['url_list'][0];
+    }
+
+    // URL có watermark
+    String downloadUrlWithWatermark = '';
+    if (videoUrlData['download_addr'] != null &&
+        videoUrlData['download_addr']['url_list'] != null &&
+        videoUrlData['download_addr']['url_list'].isNotEmpty) {
+      downloadUrlWithWatermark = videoUrlData['download_addr']['url_list'][0];
+    }
+
+    // Nếu không có URL không watermark, sử dụng URL có watermark
+    if (downloadUrl.isEmpty) {
+      downloadUrl = downloadUrlWithWatermark;
+    }
+
+    if (downloadUrl.isEmpty) {
+      throw VideoApiException(
+        message: 'Không tìm thấy URL tải xuống cho video TikTok',
+      );
+    }
+
+    final List<app_models.VideoQuality> qualities = [
+      app_models.VideoQuality(
+        label: 'Không watermark',
+        url: downloadUrl,
+        fileSize: 0,
+      ),
+    ];
+
+    // Thêm phiên bản có watermark nếu khác với URL không watermark
+    if (downloadUrlWithWatermark.isNotEmpty &&
+        downloadUrlWithWatermark != downloadUrl) {
+      qualities.add(
+        app_models.VideoQuality(
+          label: 'Có watermark',
+          url: downloadUrlWithWatermark,
+          fileSize: 0,
+        ),
+      );
+    }
+
+    // Trích xuất thông tin thêm
+    final title = videoData['desc'] ?? 'TikTok Video #$videoId';
+    final author = authorData['nickname'] ?? 'TikTok Creator';
+    final authorAvatar = authorData['avatar_larger']?['url_list']?[0] ?? '';
+    final cover = videoData['cover']?['url_list']?[0] ??
+        videoData['origin_cover']?['url_list']?[0] ??
+        '';
+
+    // Tính thời lượng từ số khung hình và tốc độ khung hình
+    final duration = videoUrlData['duration'] != null
+        ? Duration(milliseconds: videoUrlData['duration'])
+        : const Duration(seconds: 15); // Mặc định 15s cho TikTok
+
+    return app_models.VideoModel(
+      id: videoId,
+      title: title,
+      author: author,
+      authorAvatarUrl: authorAvatar,
+      thumbnailUrl: cover,
+      originalUrl: url,
+      source: app_models.VideoSource.tiktok,
+      duration: duration,
+      publishedAt: DateTime.now(),
+      availableQualities: qualities,
+    );
+  }
+
+  /// Phương pháp 2: Sử dụng TikWM API
+  Future<app_models.VideoModel> getTikwmApiNoWatermark(
+      String url, String videoId) async {
+    final String apiUrl = 'https://www.tikwm.com/api/?url=$url';
+    final response = await dio.get(apiUrl);
+
+    if (response.statusCode == 200 && response.data != null) {
+      final data = response.data;
+      if (data['success'] == true && data['data'] != null) {
+        final videoData = data['data'];
+
+        final String title = videoData['title'] ?? 'TikTok Video';
+        final String author =
+            videoData['author']?['nickname'] ?? 'TikTok Creator';
+        final String authorAvatar = videoData['author']?['avatar'] ?? '';
+        final String cover =
+            videoData['cover'] ?? videoData['origin_cover'] ?? '';
+
+        // URL video
+        final String downloadUrl = videoData['play'] ?? '';
+        final String hdDownloadUrl = videoData['hdplay'] ?? downloadUrl;
+
+        if (downloadUrl.isEmpty) {
+          throw VideoApiException(
+            message: 'Không tìm thấy URL tải xuống cho video TikTok',
+          );
+        }
+
+        final List<app_models.VideoQuality> qualities = [];
+
+        if (hdDownloadUrl.isNotEmpty && hdDownloadUrl != downloadUrl) {
+          qualities.add(
+            app_models.VideoQuality(
+              label: 'HD',
+              url: hdDownloadUrl,
+              fileSize: 0,
+            ),
+          );
+        }
+
+        qualities.add(
+          app_models.VideoQuality(
+            label: 'SD',
+            url: downloadUrl,
+            fileSize: 0,
+          ),
+        );
+
+        // Thời lượng video
+        final duration = videoData['duration'] != null
+            ? Duration(seconds: int.parse(videoData['duration'].toString()))
+            : const Duration(seconds: 15);
+
+        return app_models.VideoModel(
+          id: videoId,
+          title: title,
+          author: author,
+          authorAvatarUrl: authorAvatar,
+          thumbnailUrl: cover,
+          originalUrl: url,
+          source: app_models.VideoSource.tiktok,
+          duration: duration,
+          publishedAt: DateTime.now(),
+          availableQualities: qualities,
+        );
+      }
+    }
+
+    throw VideoApiException(
+        message: 'Không thể phân tích dữ liệu video TikTok từ TikWM API');
+  }
+
+  /// Phương pháp 3: Sử dụng SsstikIO (phiên bản đơn giản hóa)
+  Future<app_models.VideoModel> getSsstikNoWatermark(
+      String url, String videoId) async {
+    try {
+      // Sử dụng direct API thay vì cơ chế form phức tạp
+      final response = await dio.get(
+        'https://api.tikmate.app/api/lookup',
+        queryParameters: {'url': url},
+        options: Options(
+          headers: {
+            'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36',
+            'Accept': 'application/json',
+          },
+        ),
+      );
+
+      if (response.statusCode == 200 && response.data != null) {
+        final data = response.data;
+
+        // Trích xuất thông tin từ phản hồi
+        String downloadUrl = data['downloadUrl'] ?? '';
+        if (downloadUrl.isEmpty) {
+          throw VideoApiException(
+              message: 'Không tìm thấy URL tải xuống từ SsstikIO API');
+        }
+
+        // Tạo danh sách chất lượng video
+        final List<app_models.VideoQuality> qualities = [
+          app_models.VideoQuality(
+            label: 'HD (Không watermark)',
+            url: downloadUrl,
+            fileSize: 0,
+          ),
+        ];
+
+        // Trích xuất thêm thông tin
+        final String title = data['title'] ?? 'TikTok Video #$videoId';
+        final String author = data['author'] ?? 'TikTok Creator';
+        final String thumbnailUrl = data['thumbnail'] ?? '';
+
+        return app_models.VideoModel(
+          id: videoId,
+          title: title,
+          author: author,
+          authorAvatarUrl: '',
+          thumbnailUrl: thumbnailUrl,
+          originalUrl: url,
+          source: app_models.VideoSource.tiktok,
+          duration: const Duration(seconds: 15),
+          publishedAt: DateTime.now(),
+          availableQualities: qualities,
+        );
+      }
+
+      throw VideoApiException(
+          message: 'Không thể phân tích dữ liệu video TikTok từ SsstikIO API');
+    } catch (e) {
+      if (e is VideoApiException) rethrow;
+      throw VideoApiException(
+          message: 'Lỗi kết nối với SsstikIO: ${e.toString()}');
     }
   }
 
