@@ -15,6 +15,15 @@ class DownloadProgressWidget extends StatelessWidget {
   /// Tiến trình tải xuống (0-100)
   final int progressPercent;
 
+  /// Tốc độ tải xuống hiện tại (định dạng chuỗi)
+  final String? downloadSpeed;
+
+  /// Số byte đã nhận
+  final int? receivedBytes;
+
+  /// Tổng số byte
+  final int? totalBytes;
+
   /// Callback khi hủy tải xuống
   final VoidCallback onCancel;
 
@@ -25,11 +34,34 @@ class DownloadProgressWidget extends StatelessWidget {
     required this.selectedQuality,
     required this.progressPercent,
     required this.onCancel,
+    this.downloadSpeed,
+    this.receivedBytes,
+    this.totalBytes,
   }) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+
+    // Tạo text hiển thị dung lượng đã tải và tốc độ
+    String progressText = '';
+
+    // Hiển thị tốc độ tải xuống nếu có (đặt trước phần trăm)
+    if (downloadSpeed != null && downloadSpeed!.isNotEmpty) {
+      progressText += '$downloadSpeed | ';
+    }
+
+    // Thêm phần trăm tiến trình
+    progressText += '$progressPercent%';
+
+    // Hiển thị dung lượng đã tải / tổng dung lượng
+    if (receivedBytes != null && totalBytes != null && totalBytes! > 0) {
+      final receivedMB = (receivedBytes! / (1024 * 1024)).toStringAsFixed(1);
+      final totalMB = (totalBytes! / (1024 * 1024)).toStringAsFixed(1);
+      progressText += ' | $receivedMB/$totalMB MB';
+    } else if (selectedQuality.formattedFileSize.isNotEmpty) {
+      progressText += ' | ${selectedQuality.formattedFileSize}';
+    }
 
     return Container(
       decoration: BoxDecoration(
@@ -172,7 +204,7 @@ class DownloadProgressWidget extends StatelessWidget {
                     ),
                   ),
                   Text(
-                    '$progressPercent%${selectedQuality.formattedFileSize.isNotEmpty ? ' | ${selectedQuality.formattedFileSize}' : ''}',
+                    progressText,
                     style: theme.textTheme.bodyMedium,
                   ),
                 ],

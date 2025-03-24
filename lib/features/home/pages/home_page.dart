@@ -3,9 +3,9 @@ import 'dart:io' show File, Platform, Process;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:flutter_spinkit/flutter_spinkit.dart';
 import 'package:lottie/lottie.dart';
 import 'package:clipboard/clipboard.dart';
-import 'package:flutter_spinkit/flutter_spinkit.dart';
 import 'package:multi_video_downloader/features/common/models/video_model.dart'
     as app_models;
 import 'package:multi_video_downloader/features/common/widgets/download_progress_widget.dart';
@@ -34,6 +34,8 @@ class _HomePageState extends State<HomePage> {
 
   app_models.VideoSource? _selectedPlatform;
   app_models.VideoQuality? _selectedQuality;
+  bool _isOpeningDirectory = false;
+  bool _isOpeningFile = false;
 
   @override
   void initState() {
@@ -280,6 +282,9 @@ class _HomePageState extends State<HomePage> {
                       video: state.videoModel,
                       selectedQuality: state.quality,
                       progressPercent: state.progress,
+                      downloadSpeed: state.downloadSpeed,
+                      receivedBytes: state.receivedBytes,
+                      totalBytes: state.totalBytes,
                       onCancel: _cancelDownload,
                     ),
                   ),
@@ -349,59 +354,159 @@ class _HomePageState extends State<HomePage> {
 
   /// Mở file video
   Future<void> _openFile(String filePath) async {
-    final file = File(filePath);
-    if (await file.exists()) {
-      try {
-        final result = await OpenFile.open(filePath);
-        if (result.type != ResultType.done) {
+    // Nếu đang xử lý, không cho phép người dùng nhấn lại
+    if (_isOpeningFile) return;
+
+    try {
+      // Đánh dấu đang trong quá trình xử lý
+      setState(() {
+        _isOpeningFile = true;
+      });
+
+      final file = File(filePath);
+      if (await file.exists()) {
+        try {
+          final result = await OpenFile.open(filePath);
+          if (result.type != ResultType.done) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Không thể mở file: ${result.message}'),
+                  backgroundColor: Colors.red,
+                ),
+              );
+            }
+          }
+        } catch (e) {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text('Không thể mở file: ${result.message}'),
+                content: Text('Lỗi khi mở file: $e'),
                 backgroundColor: Colors.red,
               ),
             );
           }
         }
-      } catch (e) {
+      } else {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Lỗi khi mở file: $e'),
+            const SnackBar(
+              content: Text('File không tồn tại'),
               backgroundColor: Colors.red,
             ),
           );
         }
       }
-    } else {
+    } finally {
+      // Đảm bảo luôn reset trạng thái sau khi hoàn thành
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('File không tồn tại'),
-            backgroundColor: Colors.red,
-          ),
-        );
+        setState(() {
+          _isOpeningFile = false;
+        });
       }
     }
   }
 
   /// Mở thư mục chứa file
   Future<void> _openDirectory(String filePath) async {
+    // Nếu đang xử lý, không cho phép người dùng nhấn lại
+    if (_isOpeningDirectory) return;
+
     try {
+      // Đánh dấu đang trong quá trình xử lý
+      setState(() {
+        _isOpeningDirectory = true;
+      });
+
       final directory = path.dirname(filePath);
+      final file = File(filePath);
+
       if (Platform.isAndroid) {
-        // Android không hỗ trợ mở thư mục trực tiếp, nên ta mở file explorer
-        final uri = Uri.parse(
-            'content://com.android.externalstorage.documents/document/primary:${directory.replaceAll('/storage/emulated/0/', '')}');
-        await launchUrl(uri);
+        // Sử dụng thư viện mở thư mục trên Android
+        try {
+          // Phương pháp 1: Dùng Storage Access Framework để mở thư mục (Android 11+)
+          final uri = Uri.parse(
+              'content://com.android.externalstorage.documents/document/primary:${directory.replaceAll('/storage/emulated/0/', '')}');
+          final result = await launchUrl(uri);
+
+          if (!result) {
+            // Phương pháp 2: Sử dụng OpenFile để mở thư mục cha của file
+            final openResult = await OpenFile.open(directory);
+
+            if (openResult.type != ResultType.done) {
+              // Phương pháp 3: Nếu không mở được thư mục, hiển thị đường dẫn và mở file manager
+              await launchUrl(Uri.parse(
+                  'content://com.android.externalstorage.documents/root/primary'));
+
+              // Hiển thị đường dẫn đến file
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('Đường dẫn file: $directory'),
+                    backgroundColor: Colors.blue,
+                    duration: const Duration(seconds: 5),
+                  ),
+                );
+              }
+            }
+          }
+        } catch (e) {
+          // Thử mở file manager
+          await launchUrl(Uri.parse(
+              'content://com.android.externalstorage.documents/root/primary'));
+
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('File đã được lưu tại:\n$directory'),
+                backgroundColor: Colors.blue,
+                duration: const Duration(seconds: 5),
+              ),
+            );
+          }
+        }
       } else if (Platform.isIOS) {
-        // iOS không hỗ trợ mở thư mục
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Đường dẫn file: $directory'),
-            backgroundColor: Colors.blue,
-          ),
-        );
+        // iOS không hỗ trợ mở thư mục nên hiển thị đường dẫn và mở ứng dụng Files
+        try {
+          // Thử dùng url_launcher để mở ứng dụng Files
+          final filesUrl = Uri.parse('shareddocuments://');
+          final canLaunch = await canLaunchUrl(filesUrl);
+
+          if (canLaunch) {
+            await launchUrl(filesUrl);
+          }
+
+          // Hiển thị thông tin đường dẫn
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Đường dẫn file: $directory'),
+                backgroundColor: Colors.blue,
+                duration: const Duration(seconds: 5),
+                action: SnackBarAction(
+                  label: 'Mở Files',
+                  onPressed: () async {
+                    final openResult = await OpenFile.open(directory);
+                    if (openResult.type != ResultType.done) {
+                      await launchUrl(filesUrl);
+                    }
+                  },
+                ),
+              ),
+            );
+          }
+        } catch (e) {
+          // Nếu không thể mở, chỉ hiển thị đường dẫn
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Đường dẫn file: $directory'),
+                backgroundColor: Colors.blue,
+                duration: const Duration(seconds: 5),
+              ),
+            );
+          }
+        }
       } else if (Platform.isMacOS) {
         await Process.run('open', [directory]);
       } else if (Platform.isWindows) {
@@ -424,6 +529,13 @@ class _HomePageState extends State<HomePage> {
             backgroundColor: Colors.red,
           ),
         );
+      }
+    } finally {
+      // Đảm bảo luôn reset trạng thái sau khi hoàn thành
+      if (mounted) {
+        setState(() {
+          _isOpeningDirectory = false;
+        });
       }
     }
   }
@@ -468,13 +580,33 @@ class _HomePageState extends State<HomePage> {
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
                   OutlinedButton.icon(
-                    onPressed: () => _openDirectory(filePath),
-                    icon: const Icon(Icons.folder_open),
+                    onPressed: _isOpeningDirectory
+                        ? null
+                        : () => _openDirectory(filePath),
+                    icon: _isOpeningDirectory
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                            ),
+                          )
+                        : const Icon(Icons.folder_open),
                     label: const Text('Mở thư mục'),
                   ),
                   ElevatedButton.icon(
-                    onPressed: () => _openFile(filePath),
-                    icon: const Icon(Icons.play_arrow),
+                    onPressed:
+                        _isOpeningFile ? null : () => _openFile(filePath),
+                    icon: _isOpeningFile
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.play_arrow),
                     label: const Text('Xem video'),
                   ),
                 ],

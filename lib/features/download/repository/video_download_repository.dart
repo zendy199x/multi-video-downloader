@@ -100,4 +100,17 @@ class VideoDownloadRepository {
       return '';
     }
   }
+
+  /// Hủy tải xuống video hiện tại nếu có
+  void cancelCurrentDownload() {
+    // Lấy client hiện tại và gọi phương thức hủy tải xuống
+    try {
+      final activeClients = apiClientFactory.getActiveClients();
+      for (final client in activeClients) {
+        client.cancelCurrentDownload();
+      }
+    } catch (e) {
+      debugPrint('Lỗi khi hủy tải xuống: ${e.toString()}');
+    }
+  }
 }

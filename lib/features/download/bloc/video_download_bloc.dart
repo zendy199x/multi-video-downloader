@@ -82,15 +82,22 @@ class VideoDownloadInProgress extends VideoDownloadState {
   final app_models.VideoModel videoModel;
   final app_models.VideoQuality quality;
   final int progress;
+  final String downloadSpeed;
+  final int receivedBytes;
+  final int totalBytes;
 
   const VideoDownloadInProgress({
     required this.videoModel,
     required this.quality,
     required this.progress,
+    this.downloadSpeed = '',
+    this.receivedBytes = 0,
+    this.totalBytes = 0,
   });
 
   @override
-  List<Object> get props => [videoModel, quality, progress];
+  List<Object> get props =>
+      [videoModel, quality, progress, downloadSpeed, receivedBytes, totalBytes];
 }
 
 /// Tải xuống hoàn tất
@@ -195,6 +202,9 @@ class VideoDownloadBloc extends Bloc<VideoDownloadEvent, VideoDownloadState> {
       ),
     );
 
+    // Tạo đối tượng theo dõi tốc độ tải xuống
+    final downloadSpeed = DownloadSpeed();
+
     try {
       String filePath = await _downloadRepository.downloadVideo(
         video: event.videoModel,
@@ -202,11 +212,18 @@ class VideoDownloadBloc extends Bloc<VideoDownloadEvent, VideoDownloadState> {
         onProgress: (received, total) {
           if (total != -1) {
             final progress = (received / total * 100).toInt();
+
+            // Cập nhật tốc độ tải xuống
+            downloadSpeed.update(received);
+
             emit(
               VideoDownloadInProgress(
                 videoModel: event.videoModel,
                 quality: event.quality,
                 progress: progress,
+                downloadSpeed: downloadSpeed.speedString,
+                receivedBytes: received,
+                totalBytes: total,
               ),
             );
           }
@@ -260,7 +277,22 @@ class VideoDownloadBloc extends Bloc<VideoDownloadEvent, VideoDownloadState> {
     CancelDownload event,
     Emitter<VideoDownloadState> emit,
   ) {
-    // Chúng ta xử lý vấn đề này trong _onDownloadVideo với tham số onCancel
-    // Nhưng chúng ta vẫn cần một sự kiện để biểu thị ý định hủy
+    try {
+      // Gọi phương thức hủy tải xuống từ repository
+      _downloadRepository.cancelCurrentDownload();
+
+      // Phát ra trạng thái đã hủy
+      emit(VideoDownloadCancelled(
+        videoModel: event.videoModel,
+        quality: app_models.VideoQuality(
+          url: '',
+          label: '',
+          fileSize: 0,
+        ),
+      ));
+    } catch (e) {
+      emit(VideoDownloadError(
+          message: 'Lỗi khi hủy tải xuống: ${e.toString()}'));
+    }
   }
 }

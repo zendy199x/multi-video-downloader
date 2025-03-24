@@ -43,6 +43,9 @@ abstract class VideoApiClient {
   /// Dio client cho các network requests
   final Dio dio;
 
+  /// Callback để hủy tải xuống hiện tại
+  VoidCallback? _currentCancelCallback;
+
   /// Constructor
   VideoApiClient(this.dio) {
     dio.options.connectTimeout =
@@ -87,13 +90,24 @@ abstract class VideoApiClient {
       // Bắt đầu tải xuống
       onStatusChanged(DownloadStatus.inProgress, null);
 
-      // Định nghĩa hàm callback để hủy tải xuống
+      // Tạo hàm hủy tải xuống và gán vào callback
+      void cancelDownload() {
+        if (!cancelToken.isCancelled) {
+          cancelToken.cancel('Download cancelled by user');
+        }
+      }
+
+      // Gán hàm hủy vào callback được cung cấp
       if (onCancelled != null) {
-        onCancelled = () {
-          if (!cancelToken.isCancelled) {
-            cancelToken.cancel('Download cancelled by user');
-          }
+        // Sử dụng biến từ tham số như một function pointer
+        VoidCallback originalCallback = onCancelled;
+        // Định nghĩa lại callback bên ngoài
+        _currentCancelCallback = () {
+          cancelDownload();
+          originalCallback();
         };
+      } else {
+        _currentCancelCallback = cancelDownload;
       }
 
       // Bắt đầu tải xuống
@@ -127,9 +141,45 @@ abstract class VideoApiClient {
         message: 'Lỗi tải xuống: ${e.message}',
         statusCode: e.response?.statusCode,
       );
+    } on FileSystemException catch (e) {
+      // Xử lý đặc biệt cho lỗi hệ thống tệp
+      String errorMessage = 'Lỗi hệ thống tệp';
+
+      // Kiểm tra lỗi tên file quá dài
+      if (e.osError != null && e.osError!.errorCode == 63) {
+        errorMessage =
+            'Tên tệp quá dài. Hãy thử với video có tiêu đề ngắn hơn.';
+      }
+      // Kiểm tra lỗi không đủ quyền
+      else if (e.osError != null &&
+          (e.osError!.errorCode == 13 ||
+              e.osError!.message.contains('Permission denied'))) {
+        errorMessage = 'Không có quyền truy cập thư mục lưu trữ.';
+      }
+      // Kiểm tra lỗi không đủ dung lượng
+      else if (e.osError != null && e.osError!.errorCode == 28) {
+        errorMessage = 'Không đủ dung lượng lưu trữ.';
+      }
+      // Thông báo lỗi gốc nếu không thuộc các trường hợp trên
+      else {
+        errorMessage = 'Lỗi hệ thống tệp: ${e.message}';
+      }
+
+      onStatusChanged(DownloadStatus.failed, errorMessage);
+      throw VideoApiException(message: errorMessage);
     } catch (e) {
-      onStatusChanged(DownloadStatus.failed, e.toString());
-      throw VideoApiException(message: 'Lỗi tải xuống: ${e.toString()}');
+      // Kiểm tra lỗi tên file quá dài trong trường hợp chung
+      String errorMessage = 'Lỗi tải xuống';
+      if (e.toString().contains('File name too long') ||
+          e.toString().contains('errno = 63')) {
+        errorMessage =
+            'Tên tệp quá dài. Hãy thử với video có tiêu đề ngắn hơn.';
+      } else {
+        errorMessage = 'Lỗi tải xuống: ${e.toString()}';
+      }
+
+      onStatusChanged(DownloadStatus.failed, errorMessage);
+      throw VideoApiException(message: errorMessage);
     }
   }
 
@@ -150,18 +200,43 @@ abstract class VideoApiClient {
   /// Tạo tên tệp dựa trên tiêu đề video và chất lượng
   String _generateFileName(
       app_models.VideoModel video, app_models.VideoQuality quality) {
-    // Làm sạch tiêu đề video cho tên tệp
-    final sanitizedTitle = video.title
-        .replaceAll(RegExp(r'[<>:"/\\|?*]'), '') // Xóa ký tự không hợp lệ
-        .replaceAll(
-            RegExp(r'\s+'), '_'); // Thay thế khoảng trắng bằng gạch dưới
+    // Giới hạn độ dài tối đa an toàn cho tên file (macOS giới hạn 255 ký tự)
+    const int maxFileNameLength = 100;
 
-    // Tạo tên tệp theo định dạng: TenVideo_ChieuCao_Platform.mp4
+    // Làm sạch tiêu đề video cho tên tệp
+    var sanitizedTitle = video.title
+        .replaceAll(RegExp(r'[<>:"/\\|?*]'), '') // Xóa ký tự không hợp lệ
+        .replaceAll(RegExp(r'\s+'), '_') // Thay thế khoảng trắng bằng gạch dưới
+        .replaceAll(
+            RegExp(r'[^\x00-\x7F]'), ''); // Loại bỏ các ký tự không phải ASCII
+
+    // Cắt ngắn tiêu đề nếu quá dài
+    if (sanitizedTitle.length > maxFileNameLength) {
+      sanitizedTitle = sanitizedTitle.substring(0, maxFileNameLength);
+    }
+
     final platform = video.sourceName.toLowerCase();
     final height =
         quality.height != null ? '${quality.height}p' : quality.label;
 
-    return '${sanitizedTitle}_${height}_$platform.mp4';
+    // Đảm bảo tiêu đề không rỗng
+    if (sanitizedTitle.isEmpty) {
+      sanitizedTitle = 'video';
+    }
+
+    // Thêm timestamp để đảm bảo tên file là duy nhất
+    final timestamp =
+        DateTime.now().millisecondsSinceEpoch.toString().substring(6);
+
+    return '${sanitizedTitle}_${height}_${platform}_$timestamp.mp4';
+  }
+
+  /// Hủy tải xuống hiện tại nếu có
+  void cancelCurrentDownload() {
+    if (_currentCancelCallback != null) {
+      _currentCancelCallback!();
+      _currentCancelCallback = null;
+    }
   }
 
   /// Nền tảng được hỗ trợ bởi client này
@@ -309,10 +384,15 @@ class TiktokApiClient extends VideoApiClient {
 
       // Thử lần lượt từng phương pháp
       List<Future<app_models.VideoModel> Function()> methods = [
+        () => getDirectTikwmNoWatermark(
+            url, videoId), // Phương pháp mới: TikWM API trực tiếp
+        () => getNewSsstikNoWatermark(
+            url, videoId), // Phương pháp mới: SSSTIK.io API
+        () => getTikwmApiNoWatermark(url, videoId), // Phương pháp cũ: TikWM API
+        () =>
+            getSsstikNoWatermark(url, videoId), // Phương pháp cũ: SsstikIO API
         () => getAwemeApiNoWatermark(
-            url, videoId), // Phương pháp 1: API chính thức
-        () => getTikwmApiNoWatermark(url, videoId), // Phương pháp 2: TikWM API
-        () => getSsstikNoWatermark(url, videoId), // Phương pháp 3: SsstikIO
+            url, videoId), // Phương pháp cũ: API chính thức
       ];
 
       for (var method in methods) {
@@ -401,11 +481,56 @@ class TiktokApiClient extends VideoApiClient {
       );
     }
 
+    // Lấy kích thước file không watermark
+    int noWatermarkSize = 0;
+    try {
+      final headResponse = await dio.head(
+        downloadUrl,
+        options: Options(
+          followRedirects: true,
+          validateStatus: (status) => status! < 500,
+        ),
+      );
+      if (headResponse.statusCode == 200) {
+        final contentLength = headResponse.headers.value('content-length');
+        if (contentLength != null) {
+          noWatermarkSize = int.tryParse(contentLength) ?? 0;
+        }
+      }
+    } catch (e) {
+      debugPrint(
+          'Không thể lấy kích thước file không watermark: ${e.toString()}');
+    }
+
+    // Lấy kích thước file có watermark nếu có
+    int withWatermarkSize = 0;
+    if (downloadUrlWithWatermark.isNotEmpty &&
+        downloadUrlWithWatermark != downloadUrl) {
+      try {
+        final headResponse = await dio.head(
+          downloadUrlWithWatermark,
+          options: Options(
+            followRedirects: true,
+            validateStatus: (status) => status! < 500,
+          ),
+        );
+        if (headResponse.statusCode == 200) {
+          final contentLength = headResponse.headers.value('content-length');
+          if (contentLength != null) {
+            withWatermarkSize = int.tryParse(contentLength) ?? 0;
+          }
+        }
+      } catch (e) {
+        debugPrint(
+            'Không thể lấy kích thước file có watermark: ${e.toString()}');
+      }
+    }
+
     final List<app_models.VideoQuality> qualities = [
       app_models.VideoQuality(
         label: 'Không watermark',
         url: downloadUrl,
-        fileSize: 0,
+        fileSize: noWatermarkSize,
       ),
     ];
 
@@ -416,7 +541,7 @@ class TiktokApiClient extends VideoApiClient {
         app_models.VideoQuality(
           label: 'Có watermark',
           url: downloadUrlWithWatermark,
-          fileSize: 0,
+          fileSize: withWatermarkSize,
         ),
       );
     }
@@ -476,6 +601,50 @@ class TiktokApiClient extends VideoApiClient {
           );
         }
 
+        // Lấy kích thước file HD
+        int hdFileSize = 0;
+        if (hdDownloadUrl.isNotEmpty && hdDownloadUrl != downloadUrl) {
+          try {
+            final headHdResponse = await dio.head(
+              hdDownloadUrl,
+              options: Options(
+                followRedirects: true,
+                validateStatus: (status) => status! < 500,
+              ),
+            );
+            if (headHdResponse.statusCode == 200) {
+              final contentLength =
+                  headHdResponse.headers.value('content-length');
+              if (contentLength != null) {
+                hdFileSize = int.tryParse(contentLength) ?? 0;
+              }
+            }
+          } catch (e) {
+            debugPrint('Không thể lấy kích thước file HD: ${e.toString()}');
+          }
+        }
+
+        // Lấy kích thước file SD
+        int sdFileSize = 0;
+        try {
+          final headSdResponse = await dio.head(
+            downloadUrl,
+            options: Options(
+              followRedirects: true,
+              validateStatus: (status) => status! < 500,
+            ),
+          );
+          if (headSdResponse.statusCode == 200) {
+            final contentLength =
+                headSdResponse.headers.value('content-length');
+            if (contentLength != null) {
+              sdFileSize = int.tryParse(contentLength) ?? 0;
+            }
+          }
+        } catch (e) {
+          debugPrint('Không thể lấy kích thước file SD: ${e.toString()}');
+        }
+
         final List<app_models.VideoQuality> qualities = [];
 
         if (hdDownloadUrl.isNotEmpty && hdDownloadUrl != downloadUrl) {
@@ -483,7 +652,7 @@ class TiktokApiClient extends VideoApiClient {
             app_models.VideoQuality(
               label: 'HD',
               url: hdDownloadUrl,
-              fileSize: 0,
+              fileSize: hdFileSize,
             ),
           );
         }
@@ -492,7 +661,7 @@ class TiktokApiClient extends VideoApiClient {
           app_models.VideoQuality(
             label: 'SD',
             url: downloadUrl,
-            fileSize: 0,
+            fileSize: sdFileSize,
           ),
         );
 
@@ -547,12 +716,32 @@ class TiktokApiClient extends VideoApiClient {
               message: 'Không tìm thấy URL tải xuống từ SsstikIO API');
         }
 
+        // Lấy kích thước file từ header
+        int fileSize = 0;
+        try {
+          final headResponse = await dio.head(
+            downloadUrl,
+            options: Options(
+              followRedirects: true,
+              validateStatus: (status) => status! < 500,
+            ),
+          );
+          if (headResponse.statusCode == 200) {
+            final contentLength = headResponse.headers.value('content-length');
+            if (contentLength != null) {
+              fileSize = int.tryParse(contentLength) ?? 0;
+            }
+          }
+        } catch (e) {
+          debugPrint('Không thể lấy kích thước file Tikmate: ${e.toString()}');
+        }
+
         // Tạo danh sách chất lượng video
         final List<app_models.VideoQuality> qualities = [
           app_models.VideoQuality(
             label: 'HD (Không watermark)',
             url: downloadUrl,
-            fileSize: 0,
+            fileSize: fileSize,
           ),
         ];
 
@@ -584,6 +773,273 @@ class TiktokApiClient extends VideoApiClient {
     }
   }
 
+  /// Phương pháp 4: Sử dụng SSSTIK.io API
+  Future<app_models.VideoModel> getNewSsstikNoWatermark(
+      String url, String videoId) async {
+    try {
+      // Lấy HTML trang SSSTIK.io để có được token
+      final htmlResponse = await dio.get(
+        'https://ssstik.io/en',
+        options: Options(
+          headers: {
+            'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36',
+            'Accept':
+                'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        ),
+      );
+
+      // Trích xuất token tt từ HTML
+      final htmlContent = htmlResponse.data.toString();
+      // Tìm token tt trong HTML bằng regex đơn giản
+      final regexPattern = r'tt:"([^"]*)"';
+      final regex = RegExp(regexPattern);
+      final match = regex.firstMatch(htmlContent);
+      final tt = match?.group(1) ?? '';
+
+      if (tt.isEmpty) {
+        throw VideoApiException(
+            message: 'Không thể lấy token bảo mật từ SSSTIK.io');
+      }
+
+      // Tạo form data với token
+      final formData = FormData.fromMap({
+        'id': url,
+        'locale': 'en',
+        'tt': tt,
+      });
+
+      // Gửi POST request để lấy video
+      final response = await dio.post(
+        'https://ssstik.io/abc?url=dl',
+        data: formData,
+        options: Options(
+          headers: {
+            'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36',
+            'Accept':
+                'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Referer': 'https://ssstik.io/en',
+          },
+        ),
+      );
+
+      // Parse HTML để tìm liên kết tải xuống
+      final htmlData = response.data.toString();
+
+      // Regex cho URL không watermark
+      final downloadRegex =
+          RegExp(r'href="(https?://[^"]+)" class="without_watermark');
+      final downloadMatch = downloadRegex.firstMatch(htmlData);
+      final downloadUrl = downloadMatch?.group(1) ?? '';
+
+      // Nếu không tìm thấy URL
+      if (downloadUrl.isEmpty) {
+        throw VideoApiException(
+            message: 'Không tìm thấy URL tải xuống từ SSSTIK.io');
+      }
+
+      // Trích xuất thông tin cơ bản từ HTML
+      final titleRegex = RegExp(r'<title[^>]*>([^<]+)</title>');
+      final titleMatch = titleRegex.firstMatch(htmlData);
+      String title = titleMatch?.group(1) ?? 'TikTok Video #$videoId';
+
+      // Loại bỏ "TikTok video download" khỏi tiêu đề
+      title = title.replaceAll(' TikTok video download', '').trim();
+
+      // Regex cho author và thumbnail
+      final authorRegex = RegExp(r'class="author[^"]*"[^>]*>([^<]+)</');
+      final authorMatch = authorRegex.firstMatch(htmlData);
+      final author = authorMatch?.group(1)?.trim() ?? 'TikTok Creator';
+
+      // Lấy thông tin kích thước file
+      int fileSize = 0;
+      try {
+        // Gửi HEAD request để lấy kích thước file
+        final headResponse = await dio.head(
+          downloadUrl,
+          options: Options(
+            followRedirects: true,
+            validateStatus: (status) => status! < 500,
+          ),
+        );
+        // Lấy kích thước từ header Content-Length
+        if (headResponse.statusCode == 200) {
+          final contentLength = headResponse.headers.value('content-length');
+          if (contentLength != null) {
+            fileSize = int.tryParse(contentLength) ?? 0;
+          }
+        }
+      } catch (e) {
+        debugPrint('Không thể lấy kích thước file: ${e.toString()}');
+      }
+
+      final List<app_models.VideoQuality> qualities = [
+        app_models.VideoQuality(
+          label: 'HD (Không watermark)',
+          url: downloadUrl,
+          fileSize: fileSize,
+        ),
+      ];
+
+      return app_models.VideoModel(
+        id: videoId,
+        title: title,
+        author: author,
+        authorAvatarUrl: '',
+        thumbnailUrl: '',
+        originalUrl: url,
+        source: app_models.VideoSource.tiktok,
+        duration: const Duration(seconds: 15), // Mặc định 15s cho TikTok
+        publishedAt: DateTime.now(),
+        availableQualities: qualities,
+      );
+    } catch (e) {
+      if (e is VideoApiException) rethrow;
+      throw VideoApiException(
+          message: 'Lỗi kết nối với SSSTIK.io: ${e.toString()}');
+    }
+  }
+
+  /// Phương pháp 5: Sử dụng TikWM API trực tiếp
+  Future<app_models.VideoModel> getDirectTikwmNoWatermark(
+      String url, String videoId) async {
+    try {
+      final response = await dio.get(
+        'https://www.tikwm.com/api/',
+        queryParameters: {
+          'url': url,
+          'hd': '1',
+        },
+        options: Options(
+          headers: {
+            'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+            'Referer': 'https://www.tikwm.com/',
+          },
+        ),
+      );
+
+      if (response.statusCode == 200 && response.data != null) {
+        final data = response.data;
+        if (data['code'] == 0 && data['data'] != null) {
+          final videoData = data['data'];
+
+          // URL video không watermark
+          String downloadUrl = videoData['play'] ?? '';
+          if (downloadUrl.isEmpty) {
+            throw VideoApiException(
+                message: 'Không tìm thấy URL tải xuống từ TikWM API');
+          }
+
+          // URL HD (nếu có)
+          final String hdDownloadUrl = videoData['hdplay'] ?? '';
+
+          // Lấy kích thước file cho URL tiêu chuẩn
+          int standardFileSize = 0;
+          try {
+            final headStandardResponse = await dio.head(
+              downloadUrl,
+              options: Options(
+                followRedirects: true,
+                validateStatus: (status) => status! < 500,
+              ),
+            );
+            if (headStandardResponse.statusCode == 200) {
+              final contentLength =
+                  headStandardResponse.headers.value('content-length');
+              if (contentLength != null) {
+                standardFileSize = int.tryParse(contentLength) ?? 0;
+              }
+            }
+          } catch (e) {
+            debugPrint('Không thể lấy kích thước file SD: ${e.toString()}');
+          }
+
+          // Lấy kích thước file cho URL HD (nếu có)
+          int hdFileSize = 0;
+          if (hdDownloadUrl.isNotEmpty) {
+            try {
+              final headHdResponse = await dio.head(
+                hdDownloadUrl,
+                options: Options(
+                  followRedirects: true,
+                  validateStatus: (status) => status! < 500,
+                ),
+              );
+              if (headHdResponse.statusCode == 200) {
+                final contentLength =
+                    headHdResponse.headers.value('content-length');
+                if (contentLength != null) {
+                  hdFileSize = int.tryParse(contentLength) ?? 0;
+                }
+              }
+            } catch (e) {
+              debugPrint('Không thể lấy kích thước file HD: ${e.toString()}');
+            }
+          }
+
+          // Tạo danh sách chất lượng video
+          final List<app_models.VideoQuality> qualities = [];
+
+          // Thêm phiên bản HD nếu có
+          if (hdDownloadUrl.isNotEmpty) {
+            qualities.add(
+              app_models.VideoQuality(
+                label: 'HD (Không watermark)',
+                url: hdDownloadUrl,
+                fileSize: hdFileSize,
+              ),
+            );
+          }
+
+          // Luôn thêm phiên bản chuẩn
+          qualities.add(
+            app_models.VideoQuality(
+              label: 'SD (Không watermark)',
+              url: downloadUrl,
+              fileSize: standardFileSize,
+            ),
+          );
+
+          // Trích xuất các thông tin khác
+          final String title = videoData['title'] ?? 'TikTok Video #$videoId';
+          final String author =
+              videoData['author']['nickname'] ?? 'TikTok Creator';
+          final String authorAvatar = videoData['author']['avatar'] ?? '';
+          final String thumbnailUrl =
+              videoData['cover'] ?? videoData['origin_cover'] ?? '';
+
+          // Lấy thời lượng
+          final int durationSeconds =
+              int.tryParse(videoData['duration'].toString()) ?? 15;
+
+          return app_models.VideoModel(
+            id: videoId,
+            title: title,
+            author: author,
+            authorAvatarUrl: authorAvatar,
+            thumbnailUrl: thumbnailUrl,
+            originalUrl: url,
+            source: app_models.VideoSource.tiktok,
+            duration: Duration(seconds: durationSeconds),
+            publishedAt: DateTime.now(),
+            availableQualities: qualities,
+          );
+        }
+      }
+
+      throw VideoApiException(
+          message: 'Không thể phân tích dữ liệu video TikTok từ TikWM API');
+    } catch (e) {
+      if (e is VideoApiException) rethrow;
+      throw VideoApiException(
+          message: 'Lỗi kết nối với TikWM API: ${e.toString()}');
+    }
+  }
+
   @override
   app_models.VideoSource get supportedPlatform => app_models.VideoSource.tiktok;
 }
@@ -592,6 +1048,9 @@ class TiktokApiClient extends VideoApiClient {
 class VideoApiClientFactory {
   final Dio _dio;
 
+  /// Danh sách các client đang hoạt động
+  final List<VideoApiClient> _activeClients = [];
+
   VideoApiClientFactory(this._dio);
 
   /// Tạo API client dựa trên URL hoặc nguồn được chỉ định
@@ -599,11 +1058,15 @@ class VideoApiClientFactory {
     // Xác định nguồn từ URL nếu không được chỉ định
     source ??= _determineSourceFromUrl(url);
 
+    // Tạo client mới
+    VideoApiClient client;
     switch (source) {
       case app_models.VideoSource.youtube:
-        return YoutubeApiClient(_dio);
+        client = YoutubeApiClient(_dio);
+        break;
       case app_models.VideoSource.tiktok:
-        return TiktokApiClient(_dio);
+        client = TiktokApiClient(_dio);
+        break;
       case app_models.VideoSource.instagram:
       case app_models.VideoSource.facebook:
       case app_models.VideoSource.twitter:
@@ -611,6 +1074,20 @@ class VideoApiClientFactory {
       default:
         throw Exception('Nền tảng ${source.toString()} chưa được hỗ trợ');
     }
+
+    // Thêm vào danh sách client hoạt động
+    _activeClients.add(client);
+    return client;
+  }
+
+  /// Lấy danh sách các client đang hoạt động
+  List<VideoApiClient> getActiveClients() {
+    return List.unmodifiable(_activeClients);
+  }
+
+  /// Xóa client khỏi danh sách hoạt động
+  void removeClient(VideoApiClient client) {
+    _activeClients.remove(client);
   }
 
   /// Xác định nền tảng từ URL
